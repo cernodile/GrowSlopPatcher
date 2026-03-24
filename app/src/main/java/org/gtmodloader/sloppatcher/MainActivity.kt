@@ -162,6 +162,8 @@ fun FilePickerScreen(modifier: Modifier = Modifier) {
     var soUri by remember { mutableStateOf<Uri?>(null) }
     var iconUri by remember { mutableStateOf<Uri?>(null) }
     var soFileName by remember { mutableStateOf<String?>(null) }
+    var customPackageName by remember { mutableStateOf("") }
+    var appVisualName by remember { mutableStateOf("Growtopia") }
     var apkInfo by remember { mutableStateOf<ApkInfo?>(null) }
     var isSoValid by remember { mutableStateOf(false) }
 
@@ -196,6 +198,11 @@ fun FilePickerScreen(modifier: Modifier = Modifier) {
                 errorMessage = "Selected file is not a valid .so (ELF) file"
             } else {
                 errorMessage = null
+                // Default package name
+                val baseName = fileName?.removePrefix("lib")?.removeSuffix(".so") ?: ""
+                if (customPackageName.isEmpty() || customPackageName.startsWith("com.rtsoft.growtopia.")) {
+                    customPackageName = "com.rtsoft.growtopia.$baseName"
+                }
             }
         } else {
             isSoValid = false
@@ -248,7 +255,7 @@ fun FilePickerScreen(modifier: Modifier = Modifier) {
             Spacer(modifier = Modifier.height(16.dp))
             Text(text = progressMessage)
         } else if (resultApkFile != null) {
-            Text(text = "Modification Complete!", color = MaterialTheme.colorScheme.primary)
+            Text(text = "✅ Modification Complete!", color = MaterialTheme.colorScheme.primary)
             Spacer(modifier = Modifier.height(16.dp))
             
             Button(
@@ -317,6 +324,26 @@ fun FilePickerScreen(modifier: Modifier = Modifier) {
 
             Spacer(modifier = Modifier.height(24.dp))
 
+            OutlinedTextField(
+                value = customPackageName,
+                onValueChange = { customPackageName = it },
+                label = { Text("Package Name (Optional)") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            OutlinedTextField(
+                value = appVisualName,
+                onValueChange = { appVisualName = it },
+                label = { Text("App Name") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
+
+            Spacer(modifier = Modifier.height(24.dp))
+
             Button(
                 onClick = { iconPickerLauncher.launch("image/*") },
                 modifier = Modifier.fillMaxWidth()
@@ -346,6 +373,8 @@ fun FilePickerScreen(modifier: Modifier = Modifier) {
                         apkUri = apkUri!!,
                         soUri = soUri!!,
                         soFileName = soFileName!!,
+                        appName = appVisualName,
+                        targetPackageName = customPackageName,
                         iconUri = iconUri,
                         onProgress = { progressMessage = it },
                         onComplete = { file ->

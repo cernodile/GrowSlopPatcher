@@ -16,6 +16,10 @@ import org.jf.dexlib2.DexFileFactory
 import org.jf.dexlib2.Opcodes
 import org.jf.smali.Smali
 import org.jf.smali.SmaliOptions
+import com.reandroid.arsc.chunk.TableBlock
+import com.reandroid.arsc.model.ResourceEntry
+import com.reandroid.xml.XMLDocument
+import com.reandroid.xml.XMLElement
 import java.io.*
 import java.math.BigInteger
 import java.security.*
@@ -52,6 +56,8 @@ object ModProcessor {
         apkUri: Uri,
         soUri: Uri,
         soFileName: String,
+        appName: String,
+        targetPackageName: String,
         iconUri: Uri?,
         onProgress: (String) -> Unit,
         onComplete: (File) -> Unit,
@@ -75,7 +81,70 @@ object ModProcessor {
                     originalApk.outputStream().use { output -> input.copyTo(output) }
                 }
 
-                // 2. Extract classes.dex
+                var binaryManifest: ByteArray? = null
+                var binaryResources: ByteArray? = null
+
+                ZipInputStream(originalApk.inputStream()).use { zis ->
+                    var entry = zis.nextEntry
+                    while (entry != null) {
+                        when (entry.name) {
+                            "AndroidManifest.xml" -> binaryManifest = zis.readBytes()
+                            "resources.arsc" -> binaryResources = zis.readBytes()
+                        }
+                        entry = zis.nextEntry
+                    }
+                }
+
+                // 2. Patch Package Name (Binary AndroidManifest.xml)
+                binaryManifest?.let { bytes ->
+                    onProgress("Patching Manifest String Pool...")
+                    val manifestBlock = com.reandroid.arsc.chunk.xml.AndroidManifestBlock()
+                    manifestBlock.readBytes(ByteArrayInputStream(bytes))
+                    manifestBlock.packageName = targetPackageName
+
+                    // 2. Deep-patch the XML String Pool (Simulates what Apktool does)
+                    val xmlPool = manifestBlock.stringPool
+                    for (i in 0 until xmlPool.count()) {
+                        val item = xmlPool.get(i)
+                        if (item?.get() == "com.rtsoft.growtopia") {
+                            item.set(targetPackageName)
+                        }
+                    }
+
+                    // 3. Force a full rebuild of the binary structure
+                    manifestBlock.refresh()
+                    binaryManifest = manifestBlock.getBytes()
+                }
+
+                // 3. Patch App Name (Binary resources.arsc)
+                if (appName != "Growtopia" && binaryResources != null) {
+                    onProgress("Patching App Name in Resources...")
+                    val tableBlock = TableBlock()
+                    tableBlock.readBytes(ByteArrayInputStream(binaryResources))
+
+                    val pool = tableBlock.tableStringPool
+                    var found = false
+
+                    // Manually iterate through the pool using its size
+                    for (i in 0 until pool.count()) {
+                        val item = pool.get(i)
+                        if (item?.get() == "Growtopia") {
+                            item.set(appName)
+                            found = true
+                        }
+                    }
+
+                    if (!found) {
+                        onProgress("Warning: 'Growtopia' not found in resources.arsc")
+                    } else {
+                        tableBlock.refresh()
+                    }
+
+                    binaryResources = tableBlock.getBytes()
+                }
+
+
+                // 4. Extract classes.dex
                 onProgress("Extracting classes.dex...")
                 val dexFile = File(workDir, "classes.dex")
                 ZipInputStream(originalApk.inputStream()).use { zis ->
@@ -91,7 +160,7 @@ object ModProcessor {
 
                 if (!dexFile.exists()) throw Exception("classes.dex not found in APK")
 
-                // 3. Decompile DEX to Smali
+                // 5. Decompile DEX to Smali
                 onProgress("Decompiling DEX...")
                 val smaliDir = File(workDir, "smali")
                 val dexFileObj = DexFileFactory.loadDexFile(dexFile, Opcodes.getDefault())
@@ -99,7 +168,7 @@ object ModProcessor {
                 baksmaliOptions.apiLevel = 24
                 Baksmali.disassembleDexFile(dexFileObj, smaliDir, Runtime.getRuntime().availableProcessors(), baksmaliOptions)
 
-                // 4. Modify Smali
+                // 6. Modify Smali
                 onProgress("Modifying Smali...")
                 val mainSmaliFile = File(smaliDir, "com/rtsoft/growtopia/Main.smali")
                 if (mainSmaliFile.exists()) {
@@ -116,18 +185,42 @@ object ModProcessor {
 
                         if (content.contains(target)) {
                             content = content.replace(target, patch)
-                            mainSmaliFile.writeText(content)
                         } else {
                             onProgress("Warning: Target signature not found in Main.smali")
                         }
                     } else {
                         onProgress("Main.smali already patched, skipping.")
                     }
+                    if (content.contains("const-string v0, \"com.rtsoft.growtopia\""))
+                    {
+                        content = content.replace("const-string v0, \"com.rtsoft.growtopia\"",
+                                "const-string v0, \"$targetPackageName\"");
+                    }
+                    mainSmaliFile.writeText(content)
                 } else {
                     onProgress("Warning: Main.smali not found at expected path.")
                 }
 
-                // 5. Recompile Smali to DEX
+                val buildConfigSmali = File(smaliDir, "com/rtsoft/growtopia/BuildConfig.smali")
+                if (buildConfigSmali.exists()) {
+                    var content = buildConfigSmali.readText()
+                    if (!content.contains(".field public static final APPLICATION_ID:Ljava/lang/String; = \"com.rtsoft.growtopia\"")) {
+                        content = content.replace(".field public static final APPLICATION_ID:Ljava/lang/String; = \"com.rtsoft.growtopia\"",
+                            ".field public static final APPLICATION_ID:Ljava/lang/String; = \"$targetPackageName\"")
+                        buildConfigSmali.writeText(content);
+                    }
+                }
+                val sharedActivitySmali = File(smaliDir, "com/rtsoft/growtopia/SharedActivity.smali")
+                if (sharedActivitySmali.exists()) {
+                    var content = sharedActivitySmali.readText()
+                    if (!content.contains("public static PackageName:Ljava/lang/String; = \"com.rtsoft.growtopia\"")) {
+                        content = content.replace("public static PackageName:Ljava/lang/String; = \"com.rtsoft.growtopia\"",
+                            "public static PackageName:Ljava/lang/String; = \"$targetPackageName\"")
+                        sharedActivitySmali.writeText(content);
+                    }
+                }
+
+                // 7. Recompile Smali to DEX
                 onProgress("Recompiling Smali...")
                 val modifiedDex = File(workDir, "classes_mod.dex")
                 val smaliOptions = SmaliOptions()
@@ -139,7 +232,7 @@ object ModProcessor {
                     throw Exception("Smali assembly failed")
                 }
 
-                // 6. Rebuild APK
+                // 8. Rebuild APK
                 onProgress("Rebuilding APK...")
                 val userIconBitmap = iconUri?.let { uri ->
                     context.contentResolver.openInputStream(uri)?.use {
@@ -158,11 +251,13 @@ object ModProcessor {
                     val entry = entries.nextElement()
                     val name = entry.name
 
-                    // 1. Skip files we are replacing
+                    // Skip files we are replacing
                     val isIcon = userIconBitmap != null && name.contains("res/mipmap") && name.endsWith(iconTargetName)
                     if (name == "classes.dex" || name.startsWith("META-INF/") || isIcon) continue
+                    if (name == "AndroidManifest.xml") continue
+                    if (name == "resources.arsc" && appName != "Growtopia") continue
 
-                    // 2. Clone entry and preserve Unix attributes
+                    // Clone entry and preserve Unix attributes
                     val newEntry = ZipArchiveEntry(entry)
 
                     // Ensure .so files and directories have executable permissions (0755)
@@ -175,7 +270,7 @@ object ModProcessor {
                         newEntry.unixMode = 420 // Octal 0644
                     }
 
-                    // 3. Handle alignment for STORED files (zipalign requirement)
+                    // Handle alignment for STORED files (zipalign requirement)
                     if (newEntry.method == ZipArchiveEntry.STORED) {
                         newEntry.setAlignment(4)
                     }
@@ -187,14 +282,14 @@ object ModProcessor {
                     zos.closeArchiveEntry()
                 }
 
-                // 4. Add Modified classes.dex
+                // Add Modified classes.dex
                 val dexEntry = ZipArchiveEntry("classes.dex")
                 dexEntry.unixMode = 420
                 zos.putArchiveEntry(dexEntry)
                 modifiedDex.inputStream().use { it.copyTo(zos) }
                 zos.closeArchiveEntry()
 
-                // 5. Replace ALL density icons
+                // Replace ALL density icons
                 if (userIconBitmap != null) {
                     val originalEntries = zipFile.entries
                     while (originalEntries.hasMoreElements()) {
@@ -209,7 +304,33 @@ object ModProcessor {
                     }
                 }
 
-                // 6. Add new .so file
+                // Add modified manifest and strings if applicable
+                if (targetPackageName?.isNotEmpty() == true) {
+                    val manifestEntry = ZipArchiveEntry("AndroidManifest.xml")
+                    manifestEntry.unixMode = 420
+                    manifestEntry.method = ZipArchiveEntry.DEFLATED
+                    manifestEntry.setAlignment(4)
+                    zos.putArchiveEntry(manifestEntry)
+                    zos.write(binaryManifest)
+                    zos.closeArchiveEntry()
+                }
+                if (appName != "Growtopia") {
+                    val arscEntry = ZipArchiveEntry("resources.arsc")
+                    arscEntry.unixMode = 420
+                    arscEntry.method = ZipArchiveEntry.STORED
+                    arscEntry.size = binaryResources?.size?.toLong()!!
+                    arscEntry.compressedSize = binaryResources.size.toLong()
+                    arscEntry.setAlignment(4)
+
+                    val crc = CRC32().apply { update(binaryResources) }
+                    arscEntry.crc = crc.value
+
+                    zos.putArchiveEntry(arscEntry)
+                    zos.write(binaryResources)
+                    zos.closeArchiveEntry()
+                }
+
+                // Add new .so file
                 onProgress("Injecting .so...")
                 val soBytes = context.contentResolver.openInputStream(soUri)?.use { it.readBytes() }
                     ?: throw Exception("Cannot read .so file")
@@ -232,7 +353,7 @@ object ModProcessor {
                 zos.finish()
                 zos.close()
 
-                // 7. Sign APK
+                // Sign APK
                 onProgress("Signing APK...")
                 signApk(context, outputApk, signedApk)
 
