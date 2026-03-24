@@ -25,6 +25,7 @@ import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import org.apache.commons.compress.archivers.zip.*
 
 object ModProcessor {
 
@@ -146,104 +147,90 @@ object ModProcessor {
                     }
                 }
 
-                val cos = CountingOutputStream(BufferedOutputStream(outputApk.outputStream()))
-                ZipOutputStream(cos).use { zos ->
-                    var foundAndReplacedLibrary = false
-                    ZipInputStream(BufferedInputStream(originalApk.inputStream())).use { zis ->
-                        var entry = zis.nextEntry
-                        while (entry != null) {
-                            val name = entry.name
+                val iconTargetName = "icon.png" // Standard icon name
+                val zos = ZipArchiveOutputStream(BufferedOutputStream(FileOutputStream(outputApk)))
 
-                            // Check if this is an icon file we want to replace
-                            val isIcon = userIconBitmap != null && name.contains("icon.png")
+                // Open the original APK as a ZipFile to preserve permissions/attributes
+                val zipFile = ZipFile(originalApk)
+                val entries = zipFile.entries
 
-                            if (name != "classes.dex" && !name.startsWith("META-INF/") && !isIcon) {
-                                if (name == "resources.arsc" || name.endsWith(".so")) {
-                                    val bytes = zis.readBytes()
-                                    val newEntry = ZipEntry(name)
-                                    newEntry.method = ZipEntry.STORED
-                                    newEntry.size = bytes.size.toLong()
-                                    newEntry.compressedSize = bytes.size.toLong()
-                                    val crc = CRC32()
-                                    crc.update(bytes)
-                                    newEntry.crc = crc.value
+                while (entries.hasMoreElements()) {
+                    val entry = entries.nextElement()
+                    val name = entry.name
 
-                                    val currentPos = cos.getCount()
-                                    val padding = (4 - (currentPos + 30 + name.length) % 4) % 4
-                                    if (padding > 0) {
-                                        newEntry.extra = ByteArray(padding.toInt())
-                                    }
+                    // 1. Skip files we are replacing
+                    val isIcon = userIconBitmap != null && name.contains("res/mipmap") && name.endsWith(iconTargetName)
+                    if (name == "classes.dex" || name.startsWith("META-INF/") || isIcon) continue
 
-                                    zos.putNextEntry(newEntry)
-                                    zos.write(bytes)
+                    // 2. Clone entry and preserve Unix attributes
+                    val newEntry = ZipArchiveEntry(entry)
 
-                                    if (name.endsWith(soFileName)) {
-                                        onProgress("Added .so file...")
-                                        foundAndReplacedLibrary = true
-                                    }
-                                } else {
-                                    zos.putNextEntry(ZipEntry(name))
-                                    zis.copyTo(zos)
-                                }
-                                zos.closeEntry()
-                            } else if (isIcon && userIconBitmap != null) {
-                                // Replace icon with resized version
-                                val originalBytes = zis.readBytes()
-                                val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                                BitmapFactory.decodeByteArray(originalBytes, 0, originalBytes.size, options)
-
-                                val targetWidth = options.outWidth
-                                val targetHeight = options.outHeight
-
-                                val resizedBytes = if (targetWidth > 0 && targetHeight > 0) {
-                                    val format = if (name.endsWith(".webp")) Bitmap.CompressFormat.WEBP else Bitmap.CompressFormat.PNG
-                                    val out = ByteArrayOutputStream()
-                                    val scaledBitmap = Bitmap.createScaledBitmap(userIconBitmap, targetWidth, targetHeight, true)
-                                    scaledBitmap.compress(format, 100, out)
-                                    if (scaledBitmap != userIconBitmap) scaledBitmap.recycle()
-                                    out.toByteArray()
-                                } else {
-                                    originalBytes // Keep original if we can't determine size
-                                }
-
-                                val newEntry = ZipEntry(name)
-                                zos.putNextEntry(newEntry)
-                                zos.write(resizedBytes)
-                                zos.closeEntry()
-                            }
-                            entry = zis.nextEntry
-                        }
+                    // Ensure .so files and directories have executable permissions (0755)
+                    if (name.endsWith(".so") || entry.isDirectory) {
+                        // Skip our library if it already exists
+                        if (name.endsWith(soFileName))
+                            continue
+                        newEntry.unixMode = 493 // Octal 0755
+                    } else {
+                        newEntry.unixMode = 420 // Octal 0644
                     }
-                    userIconBitmap?.recycle()
 
-                    zos.putNextEntry(ZipEntry("classes.dex"))
-                    modifiedDex.inputStream().use { it.copyTo(zos) }
-                    zos.closeEntry()
+                    // 3. Handle alignment for STORED files (zipalign requirement)
+                    if (newEntry.method == ZipArchiveEntry.STORED) {
+                        newEntry.setAlignment(4)
+                    }
 
-                    if (!foundAndReplacedLibrary) {
-                        onProgress("Adding .so file...")
-                        val soInputStream = context.contentResolver.openInputStream(soUri)
-                            ?: throw Exception("Cannot open .so URI")
-                        val soBytes = soInputStream.use { it.readBytes() }
-                        val soEntry = ZipEntry("lib/arm64-v8a/$soFileName")
-                        soEntry.method = ZipEntry.STORED
-                        soEntry.size = soBytes.size.toLong()
-                        soEntry.compressedSize = soBytes.size.toLong()
-                        val crc = CRC32()
-                        crc.update(soBytes)
-                        soEntry.crc = crc.value
+                    zos.putArchiveEntry(newEntry)
+                    if (!entry.isDirectory) {
+                        zipFile.getInputStream(entry).use { it.copyTo(zos) }
+                    }
+                    zos.closeArchiveEntry()
+                }
 
-                        val currentPos = cos.getCount()
-                        val padding = (4 - (currentPos + 30 + soEntry.name.length) % 4) % 4
-                        if (padding > 0) {
-                            soEntry.extra = ByteArray(padding.toInt())
+                // 4. Add Modified classes.dex
+                val dexEntry = ZipArchiveEntry("classes.dex")
+                dexEntry.unixMode = 420
+                zos.putArchiveEntry(dexEntry)
+                modifiedDex.inputStream().use { it.copyTo(zos) }
+                zos.closeArchiveEntry()
+
+                // 5. Replace ALL density icons
+                if (userIconBitmap != null) {
+                    val originalEntries = zipFile.entries
+                    while (originalEntries.hasMoreElements()) {
+                        val e = originalEntries.nextElement()
+                        if (e.name.contains("res/mipmap") && e.name.endsWith(iconTargetName)) {
+                            val iconEntry = ZipArchiveEntry(e.name)
+                            iconEntry.unixMode = 420
+                            zos.putArchiveEntry(iconEntry)
+                            userIconBitmap.compress(Bitmap.CompressFormat.PNG, 100, zos)
+                            zos.closeArchiveEntry()
                         }
-
-                        zos.putNextEntry(soEntry)
-                        zos.write(soBytes)
-                        zos.closeEntry()
                     }
                 }
+
+                // 6. Add new .so file
+                onProgress("Injecting .so...")
+                val soBytes = context.contentResolver.openInputStream(soUri)?.use { it.readBytes() }
+                    ?: throw Exception("Cannot read .so file")
+
+                val soEntry = ZipArchiveEntry("lib/arm64-v8a/$soFileName")
+                soEntry.method = ZipArchiveEntry.STORED
+                soEntry.size = soBytes.size.toLong()
+                soEntry.unixMode = 493 // 0755
+                soEntry.setAlignment(4)
+
+                // Calculate CRC
+                val crc = CRC32().apply { update(soBytes) }
+                soEntry.crc = crc.value
+
+                zos.putArchiveEntry(soEntry)
+                zos.write(soBytes) // Write the bytes directly instead of reopening a stream
+                zos.closeArchiveEntry()
+
+                zipFile.close()
+                zos.finish()
+                zos.close()
 
                 // 7. Sign APK
                 onProgress("Signing APK...")
